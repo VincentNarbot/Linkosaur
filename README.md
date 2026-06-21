@@ -53,3 +53,7 @@ All routing and settings code currently lives in `Sources/Linkosaur/main.m`. The
 ## Privacy
 
 Routing happens entirely on your Mac. Linkosaur has no networking, analytics, or URL logging. It only reads the incoming URL, applies your local rules, and passes the URL to the selected browser.
+
+## License
+
+Linkosaur is available under the [MIT License](LICENSE).
