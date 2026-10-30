@@ -14,7 +14,7 @@ static NSString *const ActionPersonal = @"personal";
 static NSString *const ActionAsk = @"ask";
 static NSString *const ActionSafe = @"safe";
 
-static NSString *const SafeDownloadNote = @"Downloads are blocked in the safe window.";
+static NSString *const SafeDownloadNote = @"Downloads are blocked in the sandbox.";
 
 // Runs in its own content world, so page scripts cannot see or undo it.
 static NSString *const SafePasswordScript =
@@ -28,7 +28,7 @@ static NSString *const SafePasswordScript =
      "  let note = notes.get(el);"
      "  if (!note) {"
      "    note = document.createElement('span');"
-     "    note.textContent = 'Passwords are blocked in the safe window.';"
+     "    note.textContent = 'Passwords are blocked in the sandbox.';"
      "    note.style.cssText = 'display:block;margin:4px 0;color:#c4291c;font:12px -apple-system,sans-serif';"
      "    notes.set(el, note);"
      "  }"
@@ -96,7 +96,7 @@ static BOOL IsWebURL(NSURL *url) {
 
 static NSString *SafeBlockReason(NSURL *url) {
     if ([url.scheme.lowercaseString isEqualToString:@"about"]) return nil;
-    if (!IsWebURL(url)) return @"Only web links open in the safe window.";
+    if (!IsWebURL(url)) return @"Only web links open in the sandbox.";
     if (IsLocalHost(url.host)) return [NSString stringWithFormat:@"Blocked %@: it is on this Mac or the local network.", url.host ?: @"link"];
     return nil;
 }
@@ -201,7 +201,7 @@ static NSString *SafeBlockReason(NSURL *url) {
 - (void)updateAddressForURL:(NSURL *)url {
     self.hostLabel.stringValue = url.host ?: @"";
     self.urlLabel.stringValue = url.absoluteString ?: @"";
-    self.window.title = url.host.length ? url.host : @"Safe window";
+    self.window.title = url.host.length ? url.host : @"Sandbox";
     self.backButton.enabled = self.webView.canGoBack;
     self.forwardButton.enabled = self.webView.canGoForward;
 }
@@ -370,7 +370,7 @@ static NSString *SafeBlockReason(NSURL *url) {
     }
     NSURL *safeURL = target ? [NSURL URLWithString:target] : nil;
     if (IsWebURL(safeURL)) [self openSafeWindowWithURL:safeURL];
-    else [self showError:@"The safe window only opens http and https links."];
+    else [self showError:@"The sandbox only opens http and https links."];
 }
 
 - (BOOL)host:(NSString *)host matchesPattern:(NSString *)rawPattern {
@@ -450,11 +450,11 @@ static NSString *SafeBlockReason(NSURL *url) {
 
     [NSApp activateIgnoringOtherApps:YES];
     NSAlert *alert = [[NSAlert alloc] init];
-    alert.messageText = [NSString stringWithFormat:@"Open %@ with…", url.host ?: @"this link"];
+    alert.messageText = url.host ?: @"This link";
     alert.informativeText = url.absoluteString;
-    [alert addButtonWithTitle:[NSString stringWithFormat:@"Work — %@", workName]];
-    [alert addButtonWithTitle:[NSString stringWithFormat:@"Personal — %@", personalName]];
-    if (allowSafeWindow) [alert addButtonWithTitle:@"Safe window"];
+    [alert addButtonWithTitle:[NSString stringWithFormat:@"Open in Work — %@", workName]];
+    [alert addButtonWithTitle:[NSString stringWithFormat:@"Open in Personal — %@", personalName]];
+    if (allowSafeWindow) [alert addButtonWithTitle:@"Open in a sandbox"];
     [alert addButtonWithTitle:@"Cancel"];
     NSModalResponse response = [alert runModal];
     if (response == NSAlertFirstButtonReturn) return ActionWork;
@@ -566,7 +566,7 @@ static NSString *SafeBlockReason(NSURL *url) {
     NSArray *choices = @[
         @{@"title": @"Work browser", @"value": ActionWork},
         @{@"title": @"Personal browser", @"value": ActionPersonal},
-        @{@"title": @"Safe window", @"value": ActionSafe},
+        @{@"title": @"Sandbox", @"value": ActionSafe},
         @{@"title": @"Ask every time", @"value": ActionAsk}
     ];
     for (NSDictionary *choice in choices) {
