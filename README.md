@@ -14,7 +14,9 @@ Linkosaur becomes your default browser handler, then quietly forwards each link 
 
 - Assign any installed browser to Work and Personal roles.
 - Add, remove, and edit domain rules; a domain also matches its subdomains.
-- Route each domain to Work, Personal, or Ask every time.
+- Route each domain to Work, Personal, a Safe window, or Ask every time.
+- Open suspicious links in a safe window: a throwaway browser that forgets everything on close, blocks password fields, downloads, uploads, camera/microphone, and pages on this Mac or the local network.
+- Any app can open a link there with `linkosaur://safe?url=<percent-encoded http(s) URL>`.
 - Choose a default action for unmatched links.
 - Runs invisibly; macOS launches it automatically when needed.
 - Stores configuration in macOS user defaults.
@@ -52,7 +54,7 @@ All routing and settings code currently lives in `Sources/Linkosaur/main.m`. The
 
 ## Privacy
 
-Routing happens entirely on your Mac. Linkosaur has no networking, analytics, or URL logging. It only reads the incoming URL, applies your local rules, and passes the URL to the selected browser.
+Routing happens entirely on your Mac. Linkosaur has no analytics or URL logging. It only reads the incoming URL, applies your local rules, and passes the URL to the selected browser. The only network traffic is the page you open in a safe window.
 
 ## License
 

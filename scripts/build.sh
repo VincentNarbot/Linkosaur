@@ -11,7 +11,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$CLANG_MODULE_CACHE_PATH"
 clang -fobjc-arc -O2 \
     -mmacosx-version-min=13.0 \
-    -framework Cocoa \
+    -framework Cocoa -framework WebKit \
     "$ROOT/Sources/Linkosaur/main.m" \
     -o "$APP/Contents/MacOS/Linkosaur"
 cp "Resources/Info.plist" "$APP/Contents/Info.plist"

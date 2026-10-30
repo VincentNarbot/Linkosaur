@@ -39,6 +39,16 @@
                 <string>https</string>
             </array>
         </dict>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>Linkosaur safe window</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>linkosaur</string>
+            </array>
+        </dict>
     </array>
     <key>CFBundleDocumentTypes</key>
     <array>

@@ -1,4 +1,6 @@
 #import <Cocoa/Cocoa.h>
+#import <WebKit/WebKit.h>
+#include <arpa/inet.h>
 
 static NSString *const LinkosaurBundleIdentifier = @"app.linkosaur.Linkosaur";
 static NSString *const WorkBrowserKey = @"WorkBrowserBundleIdentifier";
@@ -10,12 +12,266 @@ static NSString *const HasPromptedKey = @"HasPromptedForDefaultBrowser";
 static NSString *const ActionWork = @"work";
 static NSString *const ActionPersonal = @"personal";
 static NSString *const ActionAsk = @"ask";
+static NSString *const ActionSafe = @"safe";
+
+static NSString *const SafeDownloadNote = @"Downloads are blocked in the safe window.";
+
+// Runs in its own content world, so page scripts cannot see or undo it.
+static NSString *const SafePasswordScript =
+    @"(() => {"
+     "const locked = new WeakSet(), notes = new WeakMap(), roots = new WeakSet();"
+     "const isPassword = el => !!el && el.tagName === 'INPUT' && (locked.has(el) || el.type === 'password');"
+     "const lock = el => {"
+     "  locked.add(el);"
+     "  if (el.value) el.value = '';"
+     "  if (!el.disabled) el.disabled = true;"
+     "  let note = notes.get(el);"
+     "  if (!note) {"
+     "    note = document.createElement('span');"
+     "    note.textContent = 'Passwords are blocked in the safe window.';"
+     "    note.style.cssText = 'display:block;margin:4px 0;color:#c4291c;font:12px -apple-system,sans-serif';"
+     "    notes.set(el, note);"
+     "  }"
+     "  if (!note.isConnected) el.after(note);"
+     "};"
+     "const scan = root => {"
+     "  if (!root.querySelectorAll) return;"
+     "  if (isPassword(root)) lock(root);"
+     "  for (const el of root.querySelectorAll('*')) {"
+     "    if (isPassword(el)) lock(el);"
+     "    if (el.shadowRoot && !roots.has(el.shadowRoot)) watch(el.shadowRoot);"
+     "  }"
+     "};"
+     "const observer = new MutationObserver(records => {"
+     "  for (const r of records) r.type === 'attributes' ? (isPassword(r.target) && lock(r.target)) : r.addedNodes.forEach(scan);"
+     "});"
+     "const watch = root => {"
+     "  roots.add(root);"
+     "  observer.observe(root, {subtree: true, childList: true, attributes: true, attributeFilter: ['type', 'disabled', 'value']});"
+     "  scan(root);"
+     "};"
+     "watch(document);"
+     "document.addEventListener('focusin', e => { const el = e.composedPath()[0]; if (isPassword(el)) lock(el); }, true);"
+     "document.addEventListener('submit', e => {"
+     "  if (Array.from(e.target.elements || []).some(isPassword)) { e.preventDefault(); e.stopImmediatePropagation(); }"
+     "}, true);"
+     "})();";
+
+static BOOL IsLocalIPv4(uint32_t a) {
+    return (a >> 24) == 0 || (a >> 24) == 10 || (a >> 24) == 127 || (a >> 24) >= 224 ||
+           (a >> 20) == 0xAC1 || (a >> 16) == 0xC0A8 || (a >> 16) == 0xA9FE || (a >> 22) == (0x64400000u >> 22);
+}
+
+// Hosts on this Mac or the local network: local names, single-label names, private/loopback/link-local IPs.
+static BOOL IsLocalHost(NSString *rawHost) {
+    NSString *host = rawHost.lowercaseString ?: @"";
+    if ([host hasPrefix:@"["] && [host hasSuffix:@"]"]) host = [host substringWithRange:NSMakeRange(1, host.length - 2)];
+    while ([host hasSuffix:@"."]) host = [host substringToIndex:host.length - 1];
+    if (host.length == 0) return YES;
+
+    struct in_addr v4;
+    if (inet_aton(host.UTF8String, &v4) == 1) return IsLocalIPv4(ntohl(v4.s_addr));
+    struct in6_addr v6;
+    if (inet_pton(AF_INET6, [host componentsSeparatedByString:@"%"].firstObject.UTF8String, &v6) == 1) {
+        const uint8_t *b = v6.s6_addr;
+        static const uint8_t compatible[12] = {0}, mapped[12] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff},
+                             nat64[12] = {0,0x64,0xff,0x9b};
+        if (memcmp(b, compatible, 12) == 0 || memcmp(b, mapped, 12) == 0 || memcmp(b, nat64, 12) == 0) {
+            return IsLocalIPv4((uint32_t)b[12] << 24 | (uint32_t)b[13] << 16 | (uint32_t)b[14] << 8 | b[15]);
+        }
+        return (b[0] & 0xfe) == 0xfc || (b[0] == 0xfe && (b[1] & 0x80)) || b[0] == 0xff;
+    }
+
+    if (![host containsString:@"."]) return YES;
+    for (NSString *suffix in @[@"localhost", @"local", @"internal", @"lan", @"home.arpa"]) {
+        if ([host isEqualToString:suffix] || [host hasSuffix:[@"." stringByAppendingString:suffix]]) return YES;
+    }
+    return NO;
+}
+
+static BOOL IsWebURL(NSURL *url) {
+    NSString *scheme = url.scheme.lowercaseString;
+    return [scheme isEqualToString:@"http"] || [scheme isEqualToString:@"https"];
+}
+
+static NSString *SafeBlockReason(NSURL *url) {
+    if ([url.scheme.lowercaseString isEqualToString:@"about"]) return nil;
+    if (!IsWebURL(url)) return @"Only web links open in the safe window.";
+    if (IsLocalHost(url.host)) return [NSString stringWithFormat:@"Blocked %@: it is on this Mac or the local network.", url.host ?: @"link"];
+    return nil;
+}
 
 @interface FlippedView : NSView
 @end
 
 @implementation FlippedView
 - (BOOL)isFlipped { return YES; }
+@end
+
+@interface SafeWindow : NSObject <NSWindowDelegate, WKNavigationDelegate, WKUIDelegate>
+@property(nonatomic, strong) NSWindow *window;
+@property(nonatomic, strong) WKWebView *webView;
+@property(nonatomic, strong) NSButton *backButton;
+@property(nonatomic, strong) NSButton *forwardButton;
+@property(nonatomic, strong) NSTextField *hostLabel;
+@property(nonatomic, strong) NSTextField *urlLabel;
+@property(nonatomic, strong) NSTextField *noteLabel;
+@property(nonatomic, copy) void (^openInBrowser)(NSURL *url);
+@property(nonatomic, copy) void (^didClose)(SafeWindow *safeWindow);
+@end
+
+@implementation SafeWindow
+
+- (instancetype)initWithURL:(NSURL *)url {
+    self = [super init];
+    if (!self) return nil;
+
+    WKWebViewConfiguration *configuration = [[WKWebViewConfiguration alloc] init];
+    configuration.websiteDataStore = [WKWebsiteDataStore nonPersistentDataStore];
+    [configuration.userContentController addUserScript:
+        [[WKUserScript alloc] initWithSource:SafePasswordScript
+                               injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+                            forMainFrameOnly:NO
+                              inContentWorld:[WKContentWorld worldWithName:@"LinkosaurSafeWindow"]]];
+    self.webView = [[WKWebView alloc] initWithFrame:NSZeroRect configuration:configuration];
+    self.webView.navigationDelegate = self;
+    self.webView.UIDelegate = self;
+    for (NSString *key in @[@"URL", @"canGoBack", @"canGoForward"]) {
+        [self.webView addObserver:self forKeyPath:key options:0 context:nil];
+    }
+
+    self.backButton = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"chevron.left" accessibilityDescription:@"Back"]
+                                         target:self.webView action:@selector(goBack:)];
+    self.forwardButton = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"chevron.right" accessibilityDescription:@"Forward"]
+                                            target:self.webView action:@selector(goForward:)];
+    self.backButton.bordered = self.forwardButton.bordered = NO;
+
+    self.hostLabel = [NSTextField labelWithString:@""];
+    self.hostLabel.font = [NSFont systemFontOfSize:15 weight:NSFontWeightBold];
+    self.urlLabel = [NSTextField labelWithString:@""];
+    self.urlLabel.font = [NSFont systemFontOfSize:11];
+    self.urlLabel.textColor = NSColor.secondaryLabelColor;
+    for (NSTextField *label in @[self.hostLabel, self.urlLabel]) {
+        label.lineBreakMode = NSLineBreakByTruncatingTail;
+        [label setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+        [label setContentHuggingPriority:1 forOrientation:NSLayoutConstraintOrientationHorizontal];
+    }
+    NSStackView *address = [NSStackView stackViewWithViews:@[self.hostLabel, self.urlLabel]];
+    address.orientation = NSUserInterfaceLayoutOrientationVertical;
+    address.alignment = NSLayoutAttributeLeading;
+    address.spacing = 1;
+    [address setHuggingPriority:1 forOrientation:NSLayoutConstraintOrientationHorizontal];
+
+    self.noteLabel = [NSTextField labelWithString:@""];
+    self.noteLabel.font = [NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
+    self.noteLabel.textColor = NSColor.systemOrangeColor;
+    self.noteLabel.hidden = YES;
+    NSButton *open = [NSButton buttonWithTitle:@"Open in browser" target:self action:@selector(openInBrowserClicked)];
+
+    NSStackView *toolbar = [NSStackView stackViewWithViews:@[self.backButton, self.forwardButton, address, self.noteLabel, open]];
+    toolbar.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    toolbar.alignment = NSLayoutAttributeCenterY;
+    toolbar.distribution = NSStackViewDistributionFill;
+    toolbar.spacing = 10;
+    toolbar.edgeInsets = NSEdgeInsetsMake(8, 12, 8, 12);
+    NSBox *line = [[NSBox alloc] init];
+    line.boxType = NSBoxSeparator;
+    NSStackView *content = [NSStackView stackViewWithViews:@[toolbar, line, self.webView]];
+    content.orientation = NSUserInterfaceLayoutOrientationVertical;
+    content.alignment = NSLayoutAttributeWidth;
+    content.spacing = 0;
+
+    self.window = [[NSWindow alloc]
+        initWithContentRect:NSMakeRect(0, 0, 1100, 780)
+                  styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
+                    backing:NSBackingStoreBuffered defer:NO];
+    self.window.releasedWhenClosed = NO;
+    self.window.delegate = self;
+    self.window.contentView = content;
+    [self updateAddressForURL:url];
+    [self.window center];
+    [self.window makeKeyAndOrderFront:nil];
+    [self.window orderFrontRegardless];
+    if (@available(macOS 14.0, *)) [NSApp activate];
+    else [NSApp activateIgnoringOtherApps:YES];
+    [self.webView loadRequest:[NSURLRequest requestWithURL:url]];
+    return self;
+}
+
+- (void)updateAddressForURL:(NSURL *)url {
+    self.hostLabel.stringValue = url.host ?: @"";
+    self.urlLabel.stringValue = url.absoluteString ?: @"";
+    self.window.title = url.host.length ? url.host : @"Safe window";
+    self.backButton.enabled = self.webView.canGoBack;
+    self.forwardButton.enabled = self.webView.canGoForward;
+}
+
+- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)context {
+    if (self.webView.URL) [self updateAddressForURL:self.webView.URL];
+}
+
+- (void)showNote:(NSString *)note {
+    self.noteLabel.stringValue = note ?: @"";
+    self.noteLabel.hidden = note == nil;
+}
+
+- (void)openInBrowserClicked {
+    NSURL *url = self.webView.URL;
+    if (IsWebURL(url) && self.openInBrowser) self.openInBrowser(url);
+}
+
+- (void)windowWillClose:(NSNotification *)notification {
+    for (NSString *key in @[@"URL", @"canGoBack", @"canGoForward"]) [self.webView removeObserver:self forKeyPath:key];
+    [self.webView stopLoading];
+    self.webView.navigationDelegate = nil;
+    self.webView.UIDelegate = nil;
+    if (self.didClose) self.didClose(self);
+}
+
+#pragma mark WebKit policy
+
+- (void)webView:(WKWebView *)webView decidePolicyForNavigationAction:(WKNavigationAction *)navigationAction
+                                                     decisionHandler:(void (^)(WKNavigationActionPolicy))decisionHandler {
+    NSString *reason = SafeBlockReason(navigationAction.request.URL);
+    if (!reason && navigationAction.shouldPerformDownload) reason = SafeDownloadNote;
+    if (reason && (navigationAction.shouldPerformDownload || !navigationAction.targetFrame || navigationAction.targetFrame.isMainFrame)) {
+        [self showNote:reason];
+    }
+    decisionHandler(reason ? WKNavigationActionPolicyCancel : WKNavigationActionPolicyAllow);
+}
+
+- (void)webView:(WKWebView *)webView decidePolicyForNavigationResponse:(WKNavigationResponse *)navigationResponse
+                                                       decisionHandler:(void (^)(WKNavigationResponsePolicy))decisionHandler {
+    NSString *disposition = [navigationResponse.response isKindOfClass:NSHTTPURLResponse.class]
+        ? [(NSHTTPURLResponse *)navigationResponse.response valueForHTTPHeaderField:@"Content-Disposition"] : nil;
+    BOOL download = !navigationResponse.canShowMIMEType || [disposition.lowercaseString hasPrefix:@"attachment"];
+    if (download) [self showNote:SafeDownloadNote];
+    decisionHandler(download ? WKNavigationResponsePolicyCancel : WKNavigationResponsePolicyAllow);
+}
+
+- (void)webView:(WKWebView *)webView didCommitNavigation:(WKNavigation *)navigation {
+    [self showNote:nil];
+}
+
+- (WKWebView *)webView:(WKWebView *)webView createWebViewWithConfiguration:(WKWebViewConfiguration *)configuration
+   forNavigationAction:(WKNavigationAction *)navigationAction windowFeatures:(WKWindowFeatures *)windowFeatures {
+    if (navigationAction.request.URL) [webView loadRequest:navigationAction.request];
+    return nil;
+}
+
+- (void)webView:(WKWebView *)webView requestMediaCapturePermissionForOrigin:(WKSecurityOrigin *)origin
+                                                          initiatedByFrame:(WKFrameInfo *)frame
+                                                                      type:(WKMediaCaptureType)type
+                                                           decisionHandler:(void (^)(WKPermissionDecision))decisionHandler {
+    decisionHandler(WKPermissionDecisionDeny);
+}
+
+- (void)webView:(WKWebView *)webView runOpenPanelWithParameters:(WKOpenPanelParameters *)parameters
+                                               initiatedByFrame:(WKFrameInfo *)frame
+                                              completionHandler:(void (^)(NSArray<NSURL *> *))completionHandler {
+    completionHandler(nil);
+}
+
 @end
 
 @interface AppDelegate : NSObject <NSApplicationDelegate, NSTextFieldDelegate>
@@ -30,6 +286,7 @@ static NSString *const ActionAsk = @"ask";
 @property(nonatomic, strong) NSView *rulesDocumentView;
 @property(nonatomic, strong) NSMutableArray<NSMutableDictionary *> *rules;
 @property(nonatomic, strong) NSArray<NSDictionary *> *availableBrowsers;
+@property(nonatomic, strong) NSMutableArray<SafeWindow *> *safeWindows;
 @property(nonatomic) BOOL receivedURLDuringLaunch;
 @end
 
@@ -53,6 +310,7 @@ static NSString *const ActionAsk = @"ask";
             RulesKey: initialRules
         }];
         _rules = [NSMutableArray array];
+        _safeWindows = [NSMutableArray array];
         for (NSDictionary *rule in [[NSUserDefaults standardUserDefaults] arrayForKey:RulesKey]) {
             [_rules addObject:[rule mutableCopy]];
         }
@@ -101,7 +359,18 @@ static NSString *const ActionAsk = @"ask";
     self.receivedURLDuringLaunch = YES;
     NSString *value = [[event paramDescriptorForKeyword:keyDirectObject] stringValue];
     NSURL *url = value ? [NSURL URLWithString:value] : nil;
-    if (url) [self routeURL:url];
+    if (![url.scheme.lowercaseString isEqualToString:@"linkosaur"]) {
+        if (url) [self routeURL:url allowSafeWindow:YES];
+        return;
+    }
+    if (![url.host.lowercaseString isEqualToString:@"safe"]) return;
+    NSString *target = nil;
+    for (NSURLQueryItem *item in [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO].queryItems) {
+        if ([item.name isEqualToString:@"url"]) target = item.value;
+    }
+    NSURL *safeURL = target ? [NSURL URLWithString:target] : nil;
+    if (IsWebURL(safeURL)) [self openSafeWindowWithURL:safeURL];
+    else [self showError:@"The safe window only opens http and https links."];
 }
 
 - (BOOL)host:(NSString *)host matchesPattern:(NSString *)rawPattern {
@@ -131,16 +400,20 @@ static NSString *const ActionAsk = @"ask";
     return [[NSUserDefaults standardUserDefaults] stringForKey:DefaultActionKey] ?: ActionPersonal;
 }
 
-- (NSString *)bundleIdentifierForAction:(NSString *)action URL:(NSURL *)url {
-    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
-    if ([action isEqualToString:ActionWork]) return [defaults stringForKey:WorkBrowserKey];
-    if ([action isEqualToString:ActionPersonal]) return [defaults stringForKey:PersonalBrowserKey];
-    return [self askBrowserForURL:url];
-}
-
-- (void)routeURL:(NSURL *)url {
+// Links leaving a safe window ("Open in browser") must never land back in one.
+- (void)routeURL:(NSURL *)url allowSafeWindow:(BOOL)allowSafeWindow {
     NSString *action = [self actionForURL:url];
-    NSString *bundleID = [self bundleIdentifierForAction:action URL:url];
+    if ([action isEqualToString:ActionSafe] && !allowSafeWindow) action = ActionAsk;
+    if (![@[ActionWork, ActionPersonal, ActionSafe] containsObject:action]) {
+        action = [self askActionForURL:url allowSafeWindow:allowSafeWindow];
+    }
+    if (!action) return;
+    if ([action isEqualToString:ActionSafe]) {
+        [self openSafeWindowWithURL:url];
+        return;
+    }
+    NSString *bundleID = [NSUserDefaults.standardUserDefaults
+                          stringForKey:[action isEqualToString:ActionWork] ? WorkBrowserKey : PersonalBrowserKey];
     if (!bundleID) return;
 
     NSURL *applicationURL = [NSWorkspace.sharedWorkspace URLForApplicationWithBundleIdentifier:bundleID];
@@ -159,7 +432,17 @@ static NSString *const ActionAsk = @"ask";
     }];
 }
 
-- (NSString *)askBrowserForURL:(NSURL *)url {
+- (void)openSafeWindowWithURL:(NSURL *)url {
+    SafeWindow *safeWindow = [[SafeWindow alloc] initWithURL:url];
+    __weak typeof(self) weakSelf = self;
+    safeWindow.openInBrowser = ^(NSURL *pageURL) { [weakSelf routeURL:pageURL allowSafeWindow:NO]; };
+    safeWindow.didClose = ^(SafeWindow *closed) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf.safeWindows removeObject:closed]; });
+    };
+    [self.safeWindows addObject:safeWindow];
+}
+
+- (NSString *)askActionForURL:(NSURL *)url allowSafeWindow:(BOOL)allowSafeWindow {
     NSString *workID = [NSUserDefaults.standardUserDefaults stringForKey:WorkBrowserKey];
     NSString *personalID = [NSUserDefaults.standardUserDefaults stringForKey:PersonalBrowserKey];
     NSString *workName = [self browserNameForBundleIdentifier:workID] ?: @"Work browser";
@@ -171,10 +454,12 @@ static NSString *const ActionAsk = @"ask";
     alert.informativeText = url.absoluteString;
     [alert addButtonWithTitle:[NSString stringWithFormat:@"Work — %@", workName]];
     [alert addButtonWithTitle:[NSString stringWithFormat:@"Personal — %@", personalName]];
+    if (allowSafeWindow) [alert addButtonWithTitle:@"Safe window"];
     [alert addButtonWithTitle:@"Cancel"];
     NSModalResponse response = [alert runModal];
-    if (response == NSAlertFirstButtonReturn) return workID;
-    if (response == NSAlertSecondButtonReturn) return personalID;
+    if (response == NSAlertFirstButtonReturn) return ActionWork;
+    if (response == NSAlertSecondButtonReturn) return ActionPersonal;
+    if (allowSafeWindow && response == NSAlertThirdButtonReturn) return ActionSafe;
     return nil;
 }
 
@@ -281,6 +566,7 @@ static NSString *const ActionAsk = @"ask";
     NSArray *choices = @[
         @{@"title": @"Work browser", @"value": ActionWork},
         @{@"title": @"Personal browser", @"value": ActionPersonal},
+        @{@"title": @"Safe window", @"value": ActionSafe},
         @{@"title": @"Ask every time", @"value": ActionAsk}
     ];
     for (NSDictionary *choice in choices) {
